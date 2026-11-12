@@ -7,6 +7,7 @@ and responses normalized back to OpenAI-shaped objects.
 
 from pm import install_hint
 import base64
+import functools
 import importlib
 import json
 import logging
@@ -756,6 +757,42 @@ def _convert_content_to_converse(content) -> list[dict]:
     return blocks or [dict(_PLACEHOLDER_BLOCK)]
 
 
+# Converse accepts ``image`` inside ``toolResult`` only for some families (ToolResultContentBlock, Bedrock API
+# reference: "only supported by Amazon Nova and Anthropic Claude 3 and 4 models"); other models reject it, so
+# their tool-result images travel beside the ``toolResult`` in the same user turn instead.
+_TOOL_RESULT_IMAGE_PATTERNS = ("anthropic.", "amazon.nova")
+
+
+def _model_accepts_tool_result_images(model_id: Optional[str]) -> bool:
+    """Whether images may stay inside ``toolResult`` for ``model_id`` (unknown model: yes, as before). An
+    application-profile ARN is judged by the model it wraps; one that cannot be resolved gets the hoist."""
+    if not model_id:
+        return True
+    if _APPLICATION_PROFILE_ARN_RE.search(model_id):
+        model_id = _resolve_inference_profile_model_id(model_id)
+    return any(pattern in model_id.lower() for pattern in _TOOL_RESULT_IMAGE_PATTERNS)
+
+
+def _is_openai_content_part(part) -> bool:
+    """A ``text``/``image_url`` content part (or bare string), not plain tool data such as ``{"file": ...}``,
+    which ``_convert_content_to_converse`` would drop down to the ``(empty)`` placeholder."""
+    return isinstance(part, str) or (isinstance(part, dict) and part.get("type") in {"text", "image_url"})
+
+
+def _tool_result_blocks(content) -> list[dict]:
+    """Tool message content → Converse blocks. Content parts (a list, or the ``_multimodal`` envelope) keep
+    their images as image blocks instead of JSON text carrying the base64; an envelope that converts to
+    nothing sends its ``text_summary``. Strings and plain data stay one text block, as before."""
+    if isinstance(content, dict) and content.get("_multimodal"):
+        blocks = _convert_content_to_converse(content.get("content") or [])
+        if blocks == [_PLACEHOLDER_BLOCK] and content.get("text_summary"):
+            return [{"text": _safe_text(content["text_summary"])}]
+        return blocks
+    if isinstance(content, list) and content and all(map(_is_openai_content_part, content)):
+        return _convert_content_to_converse(content)
+    return [{"text": _safe_text(content if isinstance(content, str) else json.dumps(content))}]
+
+
 def _system_blocks(content) -> list[dict]:
     """System content → text blocks; blank parts are dropped, not placeholder-filled."""
     parts = [content] if isinstance(content, str) else content if isinstance(content, list) else []
@@ -1011,6 +1048,8 @@ def convert_messages_to_converse(
     loop_start = next((i for i in range(len(messages) - 1, -1, -1) if messages[i].get("role") == "user"), -1)
     system_blocks: list[dict] = []
     converse_msgs: list[dict] = []
+    images_in_place = functools.cache(lambda: _model_accepts_tool_result_images(model))
+    hoisted = False
 
     def append_turn(role: str, blocks: list[dict]) -> None:
         if converse_msgs and converse_msgs[-1]["role"] == role:
@@ -1024,9 +1063,14 @@ def convert_messages_to_converse(
         if role == "system":
             system_blocks.extend(_system_blocks(content))
         elif role == "tool":
-            result_content = content if isinstance(content, str) else json.dumps(content)
-            append_turn("user", [{"toolResult": {
-                "toolUseId": msg.get("tool_call_id", ""), "content": [{"text": _safe_text(result_content)}]}}])
+            blocks = _tool_result_blocks(content)
+            images = [b for b in blocks if "image" in b]
+            if images and not images_in_place():
+                blocks = [b for b in blocks if "image" not in b] or [dict(_PLACEHOLDER_BLOCK)]
+                hoisted = True
+            else:
+                images = []
+            append_turn("user", [{"toolResult": {"toolUseId": msg.get("tool_call_id", ""), "content": blocks}}, *images])
         elif role == "assistant":
             issuer = _issuer(msg) if model is not None else None
             own = issuer is not None and issuer == model
@@ -1035,6 +1079,9 @@ def convert_messages_to_converse(
             append_turn("assistant", blocks or [dict(_PLACEHOLDER_BLOCK)])
         elif role == "user":
             append_turn("user", _convert_content_to_converse(content))
+    if hoisted:  # a hoisted image must not split a turn's toolResult run: all toolResults first, order kept
+        for turn in (t for t in converse_msgs if t["role"] == "user"):
+            turn["content"].sort(key=lambda block: "toolResult" not in block)
     if converse_msgs and converse_msgs[0]["role"] != "user":
         converse_msgs.insert(0, {"role": "user", "content": [dict(_PLACEHOLDER_BLOCK)]})
     if converse_msgs and converse_msgs[-1]["role"] != "user":

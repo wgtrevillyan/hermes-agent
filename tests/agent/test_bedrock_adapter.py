@@ -298,6 +298,88 @@ class TestConvertMessagesToConverse:
         assert tr["toolResult"]["content"][0]["text"] == "file contents here"
 
 
+class TestToolResultImages:
+    """Image parts in a tool result (vision_analyze's native path, computer_use and browser screenshots,
+    MCP ImageContent) must reach Converse as ``image`` blocks, never as JSON text holding the base64 data
+    URL: inside ``toolResult`` where Converse accepts that, beside it in the same user turn otherwise."""
+
+    B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+    ARN = "arn:aws:bedrock:us-west-2:123456789012:application-inference-profile/abcdef123456"
+    LLAMA = "us.meta.llama3-2-90b-instruct-v1:0"
+
+    def setup_method(self):
+        from agent import bedrock_adapter
+        bedrock_adapter._inference_profile_model_cache.clear()
+
+    def _image(self):
+        import base64
+        return {"image": {"format": "png", "source": {"bytes": base64.b64decode(self.B64)}}}
+
+    def _parts(self, text="Image loaded into your context."):
+        return [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{self.B64}"}},
+        ]
+
+    def _user_turn(self, *contents, model=None):
+        """The user turn carrying the tool results for one assistant turn that made ``len(contents)`` calls."""
+        from agent.bedrock_adapter import convert_messages_to_converse
+        ids = [f"call_{i}" for i in range(len(contents))]
+        messages = [
+            {"role": "user", "content": "What is in the photo?"},
+            {"role": "assistant", "content": None, "tool_calls": [
+                {"id": i, "type": "function", "function": {"name": "vision_analyze", "arguments": "{}"}} for i in ids]},
+            *({"role": "tool", "tool_call_id": i, "content": c} for i, c in zip(ids, contents)),
+        ]
+        _system, msgs = convert_messages_to_converse(messages, model=model)
+        turn = next(m for m in msgs if any("toolResult" in b for b in m["content"]))
+        assert not any(self.B64[:40] in json.dumps(b, default=str) for b in turn["content"])
+        return turn["content"]
+
+    def _tool_result(self, content, model=None):
+        return self._user_turn(content, model=model)[0]["toolResult"]
+
+    def test_image_part_becomes_converse_image_block(self):
+        tr = self._tool_result(self._parts())
+        assert tr["toolUseId"] == "call_0"
+        assert tr["content"] == [{"text": "Image loaded into your context."}, self._image()]
+
+    def test_multimodal_envelope_is_unwrapped(self):
+        envelope = {"_multimodal": True, "content": self._parts(), "text_summary": "Image attached natively."}
+        assert self._tool_result(envelope)["content"] == [{"text": "Image loaded into your context."}, self._image()]
+        empty = {"_multimodal": True, "content": [{"type": "bogus"}], "text_summary": "fallback summary"}
+        assert self._tool_result(empty)["content"] == [{"text": "fallback summary"}]
+
+    def test_strings_and_plain_data_stay_one_text_block(self):
+        assert self._tool_result("plain output")["content"] == [{"text": "plain output"}]
+        data = [{"file": "a.py"}, {"file": "b.py"}]
+        assert self._tool_result(data)["content"] == [{"text": json.dumps(data)}]
+
+    def test_claude_and_nova_keep_images_inside_the_tool_result(self):
+        for model in ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", "global.anthropic.claude-opus-5-5",
+                      "amazon.nova-pro-v1:0"):
+            assert self._user_turn(self._parts(), model=model) == [{"toolResult": {
+                "toolUseId": "call_0", "content": [{"text": "Image loaded into your context."}, self._image()]}}]
+
+    def test_other_models_get_images_after_every_tool_result_of_the_turn(self):
+        turn = self._user_turn(self._parts("first"), self._parts("second"), model=self.LLAMA)
+        assert turn == [
+            {"toolResult": {"toolUseId": "call_0", "content": [{"text": "first"}]}},
+            {"toolResult": {"toolUseId": "call_1", "content": [{"text": "second"}]}},
+            self._image(), self._image(),
+        ]
+
+    def test_application_profile_arn_is_judged_by_its_wrapped_model(self):
+        claude = "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-6"
+        llama = "arn:aws:bedrock:us-west-2::foundation-model/meta.llama3-2-90b-instruct-v1:0"
+        # Resolving to the ARN itself means GetInferenceProfile was unavailable: the family is unknown.
+        for wrapped, in_place in ((claude, True), (llama, False), (self.ARN, False)):
+            with patch("agent.bedrock_adapter._resolve_inference_profile_model_id", return_value=wrapped):
+                turn = self._user_turn(self._parts(), model=self.ARN)
+            assert ("image" in turn[0]["toolResult"]["content"][-1]) is in_place, wrapped
+            assert ("image" in turn[-1]) is not in_place, wrapped
+
+
 
 
 # ---------------------------------------------------------------------------
